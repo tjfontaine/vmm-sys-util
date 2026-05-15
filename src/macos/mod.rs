@@ -11,3 +11,5 @@
 
 /// pipe-based emulation of Linux `eventfd(2)` for macOS targets.
 pub mod eventfd;
+/// kqueue-based emulation of Linux `epoll(7)` for macOS targets.
+pub mod epoll;
