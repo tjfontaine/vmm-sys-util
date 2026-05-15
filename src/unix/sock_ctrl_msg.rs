@@ -32,6 +32,19 @@ const SEND_FLAGS: c_int = 0;
 // Each of the following macros performs the same function as their C counterparts. They are each
 // macros because they are used to size statically allocated arrays.
 
+// macOS aligns cmsg payloads to `sizeof(uint32_t)` (4 bytes via
+// `__DARWIN_ALIGNBYTES = sizeof(__darwin_natural_t) - 1`). Linux
+// glibc/musl uses `sizeof(size_t)` / `sizeof(c_long)` (8 on
+// 64-bit). Using the wrong alignment causes msg_controllen to
+// exceed the populated cmsg, which the macOS kernel walks into
+// uninitialized space and rejects with EINVAL.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+macro_rules! CMSG_ALIGN {
+    ($len:expr) => {
+        (($len) as usize + std::mem::size_of::<u32>() - 1) & !(std::mem::size_of::<u32>() - 1)
+    };
+}
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 macro_rules! CMSG_ALIGN {
     ($len:expr) => {
         (($len) as usize + size_of::<c_long>() - 1) & !(size_of::<c_long>() - 1)
