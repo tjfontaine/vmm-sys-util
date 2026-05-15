@@ -3,30 +3,63 @@
 // macOS emulation of Linux `eventfd`.
 //
 // `eventfd(2)` is a Linux-specific kernel object: one fd, with
-// `read(2)` returning a `u64` counter and `write(2)` adding to it,
-// optionally non-blocking and optionally semaphore-mode. macOS has
-// no native equivalent.
+// `read(2)` returning a `u64` counter and `write(2)` adding to
+// it, optionally non-blocking and optionally semaphore-mode.
+// macOS has no native equivalent.
 //
 // For project-bifrost's use case (vhost-user kick/call doorbell
 // wake-ups), we need:
 //
-//   - A *single* `RawFd` an `AsRawFd` consumer can hand to `poll`,
-//     `kqueue`, or `SCM_RIGHTS` and have it become readable when
-//     someone calls `write()` on the same `EventFd`.
+//   - A `RawFd` that consumers (`AsRawFd`-trait users, pollers,
+//     kqueue, `SCM_RIGHTS` recipients) can register and have
+//     become readable when someone calls `write()` on the same
+//     `EventFd`.
 //   - `write(v)` that wakes any blocked reader.
-//   - `read()` that returns the accumulated u64 counter and clears
-//     it.
-//   - `try_clone` that returns a separate `EventFd` referring to
-//     the same kernel-side state.
+//   - `read()` that returns the accumulated u64 counter and
+//     clears it.
+//   - `try_clone` that returns a separate `EventFd` referring
+//     to the same kernel-side state.
 //
-// The emulation here uses an internal `pipe(2)`: the write end and
-// the read end are kept inside the same `EventFd`. `AsRawFd::as_raw_fd`
-// returns the *read* end, so anything that polls the fd or sends
-// it across `SCM_RIGHTS` sees the side that becomes readable on
-// `write()`. `write(v)` writes 8 bytes (little-endian u64) into the
-// write end; `read()` drains all currently-readable pairs of 8
-// bytes from the read end and sums them into the returned counter,
-// matching `eventfd(2)`'s `read(2)` semantics.
+// The emulation uses an internal AF_UNIX SOCK_STREAM
+// socketpair. The two endpoints are kept inside the struct;
+// `AsRawFd::as_raw_fd` returns the read end so anything polling
+// the fd or sending it via `SCM_RIGHTS` sees the side that
+// becomes readable when `write()` is called.  `write(v)` writes
+// 8 bytes (little-endian u64) into the write end; `read()`
+// drains all currently-readable 8-byte payloads from the read
+// end and sums them — matching Linux eventfd's accumulator
+// semantics.
+//
+// Why socketpair over `pipe(2)`:
+//
+//   - Linux eventfd is bidirectional ("either side can write,
+//     either side can read"). SOCK_STREAM socketpair matches
+//     that contract; `pipe(2)` does not.
+//   - `EventFd::try_clone` semantics work cleanly: dup'ing
+//     either end of the socketpair gives a fully-usable
+//     bidirectional endpoint, while dup'ing a pipe end gives
+//     only one direction.
+//
+// macOS does not honor `SOCK_NONBLOCK`/`SOCK_CLOEXEC` in
+// socketpair's `type` argument (those are Linux extensions),
+// so the flags are still applied via fcntl after creation.
+//
+// Why not `EVFILT_USER` or Mach ports:
+//
+//   - `EVFILT_USER` is the macOS-native equivalent of a
+//     userspace wakeup, but kqueue fds do not survive
+//     `SCM_RIGHTS` — they are per-process kernel state — so the
+//     vhost-user kick/call path that ships the EventFd to a
+//     peer process cannot use it.
+//   - Mach ports are the truly native macOS IPC, but they do
+//     not fit the `AsRawFd` API contract that vhost,
+//     vhost-user-backend, and the wider rust-vmm ecosystem
+//     build on. Wrapping a Mach port behind `AsRawFd` requires
+//     a kqueue+EVFILT_MACHPORT bridge that recreates the
+//     SCM_RIGHTS problem.
+//
+// Socketpair is the right layer of native-ness for the
+// AsRawFd-based abstraction.
 //
 // Caveats vs. the Linux primitive:
 //
@@ -67,11 +100,32 @@ pub struct EventFd {
 }
 
 impl EventFd {
-    /// Create a new pipe-backed eventfd.
+    /// Create a new socketpair-backed eventfd.
+    ///
+    /// Uses `socketpair(AF_UNIX, SOCK_STREAM, …)` rather than
+    /// `pipe(2)` because socketpair has **symmetric read/write
+    /// semantics**, matching Linux eventfd's "either side can
+    /// write, either side can read" contract. A pipe is
+    /// strictly one-directional.
+    ///
+    /// macOS does not accept `SOCK_NONBLOCK`/`SOCK_CLOEXEC` in
+    /// the `type` argument the way Linux does, so the flags are
+    /// applied via fcntl after creation.
+    ///
+    /// The two ends are kept inside the struct; `AsRawFd`
+    /// returns the read side so consumers (poll/kqueue/
+    /// SCM_RIGHTS recipients) see the fd that becomes readable
+    /// when `write()` is called. `EVFILT_USER` and Mach ports
+    /// were considered as alternatives and rejected: the
+    /// former cannot cross `SCM_RIGHTS` (per-process kqueue
+    /// state), and the latter does not fit the `AsRawFd` API
+    /// contract that vhost-user-backend builds on top of.
     pub fn new(flag: i32) -> result::Result<EventFd, io::Error> {
         let mut fds = [-1; 2];
         // SAFETY: fds is a valid two-element array.
-        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        let rc = unsafe {
+            libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr())
+        };
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
