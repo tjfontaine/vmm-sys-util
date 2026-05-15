@@ -15,10 +15,19 @@ use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::ptr::{copy_nonoverlapping, null_mut, write_unaligned};
 
 use crate::errno::{Error, Result};
-use libc::{
-    c_long, c_void, cmsghdr, iovec, msghdr, recvmsg, sendmsg, MSG_NOSIGNAL, SCM_RIGHTS, SOL_SOCKET,
-};
+use libc::{c_long, c_void, cmsghdr, iovec, msghdr, recvmsg, sendmsg, SCM_RIGHTS, SOL_SOCKET};
 use std::os::raw::c_int;
+
+// `MSG_NOSIGNAL` is a Linux extension. macOS, iOS, and the BSDs do
+// not define it; instead, callers either set `SO_NOSIGPIPE` on the
+// socket or ignore `SIGPIPE` process-wide. On platforms without
+// `MSG_NOSIGNAL` we pass 0 as the send flag and rely on the
+// caller to manage `SIGPIPE`. The bifrost host-side processes
+// already ignore `SIGPIPE` during startup.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SEND_FLAGS: c_int = libc::MSG_NOSIGNAL;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const SEND_FLAGS: c_int = 0;
 
 // Each of the following macros performs the same function as their C counterparts. They are each
 // macros because they are used to size statically allocated arrays.
@@ -45,14 +54,14 @@ fn CMSG_DATA(cmsg_buffer: *mut cmsghdr) -> *mut RawFd {
     cmsg_buffer.wrapping_offset(1) as *mut RawFd
 }
 
-#[cfg(not(target_env = "musl"))]
+#[cfg(not(any(target_env = "musl", target_os = "macos", target_os = "ios")))]
 macro_rules! CMSG_LEN {
     ($len:expr) => {
         size_of::<cmsghdr>() + ($len)
     };
 }
 
-#[cfg(target_env = "musl")]
+#[cfg(any(target_env = "musl", target_os = "macos", target_os = "ios"))]
 macro_rules! CMSG_LEN {
     ($len:expr) => {{
         let sz = size_of::<cmsghdr>() + ($len);
@@ -61,7 +70,7 @@ macro_rules! CMSG_LEN {
     }};
 }
 
-#[cfg(not(target_env = "musl"))]
+#[cfg(not(any(target_env = "musl", target_os = "macos", target_os = "ios")))]
 fn new_msghdr(iovecs: &mut [iovec]) -> msghdr {
     msghdr {
         msg_name: null_mut(),
@@ -74,7 +83,7 @@ fn new_msghdr(iovecs: &mut [iovec]) -> msghdr {
     }
 }
 
-#[cfg(target_env = "musl")]
+#[cfg(any(target_env = "musl", target_os = "macos", target_os = "ios"))]
 fn new_msghdr(iovecs: &mut [iovec]) -> msghdr {
     assert!(iovecs.len() <= (std::i32::MAX as usize));
     let mut msg: msghdr = unsafe { std::mem::zeroed() };
@@ -85,12 +94,12 @@ fn new_msghdr(iovecs: &mut [iovec]) -> msghdr {
     msg
 }
 
-#[cfg(not(target_env = "musl"))]
+#[cfg(not(any(target_env = "musl", target_os = "macos", target_os = "ios")))]
 fn set_msg_controllen(msg: &mut msghdr, cmsg_capacity: usize) {
     msg.msg_controllen = cmsg_capacity;
 }
 
-#[cfg(target_env = "musl")]
+#[cfg(any(target_env = "musl", target_os = "macos", target_os = "ios"))]
 fn set_msg_controllen(msg: &mut msghdr, cmsg_capacity: usize) {
     assert!(cmsg_capacity <= (std::u32::MAX as usize));
     msg.msg_controllen = cmsg_capacity as u32;
@@ -191,7 +200,7 @@ fn raw_sendmsg<D: IntoIovec>(fd: RawFd, out_data: &[D], out_fds: &[RawFd]) -> Re
 
     // SAFETY: Safe because the msghdr was properly constructed from valid (or null) pointers of
     // the indicated length and we check the return value.
-    let write_count = unsafe { sendmsg(fd, &msg, MSG_NOSIGNAL) };
+    let write_count = unsafe { sendmsg(fd, &msg, SEND_FLAGS) };
 
     if write_count == -1 {
         Err(Error::last())
@@ -455,7 +464,12 @@ unsafe impl IntoIovec for &[u8] {
     }
 }
 
-#[cfg(test)]
+// The existing test suite exercises send/recv with an
+// `eventfd::EventFd`, which is Linux-only. Keep those tests
+// gated to Linux/Android. macOS-specific verification lives in
+// the downstream bifrost integration test
+// (`host/bifrost/tests/shm_guest_mem.rs`).
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
     use super::*;
